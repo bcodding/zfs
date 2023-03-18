@@ -34,6 +34,7 @@
 #include <sys/zfs_vfsops.h>
 #include <sys/zfs_vnops.h>
 #include <sys/zfs_project.h>
+#include <sys/zfeature.h>
 #if defined(HAVE_VFS_SET_PAGE_DIRTY_NOBUFFERS) || \
     defined(HAVE_VFS_FILEMAP_DIRTY_FOLIO)
 #include <linux/pagemap.h>
@@ -895,6 +896,97 @@ zpl_fallocate(struct file *filp, int mode, loff_t offset, loff_t len)
 	    mode, offset, len);
 }
 
+static ssize_t
+zpl_copy_file_range(struct file *file_in, loff_t pos_in,
+					struct file *file_out, loff_t pos_out,
+					size_t len, unsigned int flags)
+{
+	ssize_t ret = 0;
+	cred_t *cr = CRED();
+	uint64_t lenp = len;
+	struct inode *i_in = file_inode(file_in);
+	struct inode *i_out = file_inode(file_out);
+	fstrans_cookie_t cookie;
+
+	/* be friendly about this particular reason */
+	if (!spa_feature_is_enabled(dmu_objset_spa(ITOZSB(i_out)->z_os),
+	    SPA_FEATURE_BLOCK_CLONING))
+		return -EOPNOTSUPP;
+
+	crhold(cr);
+	cookie = spl_fstrans_mark();
+
+	ret = -zfs_clone_range(ITOZ(i_in), &pos_in, ITOZ(i_out), &pos_out, &lenp, cr);
+	if (ret == 0)
+		ret = lenp;
+
+	if (ret == -EXDEV)
+		ret = generic_copy_file_range(file_in, pos_in, file_out,
+										pos_out, len, flags);
+
+	spl_fstrans_unmark(cookie);
+	crfree(cr);
+
+	if (ret == 0)
+		ret = lenp;
+
+	return ret;
+}
+
+static loff_t
+zpl_remap_file_range(struct file *file_in, loff_t pos_in,
+					struct file *file_out, loff_t pos_out,
+					loff_t len, unsigned int remap_flags)
+{
+	ssize_t ret = 0;
+	cred_t *cr = CRED();
+	uint64_t lenp;
+	struct inode *i_in = file_inode(file_in);
+	struct inode *i_out = file_inode(file_out);
+	fstrans_cookie_t cookie;
+
+	/* only if ranges have identical contents */
+	if (remap_flags & REMAP_FILE_DEDUP)
+		return -EINVAL;
+
+	/* be friendly about this particular reason */
+	if (!spa_feature_is_enabled(dmu_objset_spa(ITOZSB(i_out)->z_os),
+	    SPA_FEATURE_BLOCK_CLONING))
+		return -EOPNOTSUPP;
+
+	lock_two_nondirectories(i_in, i_out);
+
+	ret = generic_remap_file_range_prep(file_in, pos_in, file_out,
+			pos_out, &len, remap_flags);
+
+	if (ret || len == 0)
+		goto out_unlock;
+
+	lenp = len;
+
+	crhold(cr);
+	cookie = spl_fstrans_mark();
+
+	ret = -zfs_clone_range(ITOZ(i_in), &pos_in, ITOZ(i_out), &pos_out, &lenp, cr);
+	if (ret == 0)
+		ret = lenp;
+
+	if (ret == -EXDEV)
+		ret = generic_copy_file_range(file_in, pos_in, file_out,
+										pos_out, len, remap_flags);
+	spl_fstrans_unmark(cookie);
+	crfree(cr);
+
+out_unlock:
+	unlock_two_nondirectories(i_in, i_out);
+
+	if (ret == 0)
+		ret = lenp;
+
+	return ret;
+}
+
+
 static int
 zpl_ioctl_getversion(struct file *filp, void __user *arg)
 {
@@ -1311,6 +1403,8 @@ const struct file_operations zpl_file_operations = {
 	.aio_fsync	= zpl_aio_fsync,
 #endif
 	.fallocate	= zpl_fallocate,
+	.copy_file_range = zpl_copy_file_range,
+	.remap_file_range = zpl_remap_file_range,
 #ifdef HAVE_FILE_FADVISE
 	.fadvise	= zpl_fadvise,
 #endif
